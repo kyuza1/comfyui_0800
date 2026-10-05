@@ -4013,6 +4013,15 @@ try:
                     CHAT_MODELO = CHAT_CPU_NOME
                 else:
                     CHAT_LOCAL_CPU, CHAT_MODO = False, "reveza"
+            if chat_ok and CHAT_MODO == "fixa":
+                # ja coloca o modelo na placa agora: sem isso, a primeira mensagem esperava 20-60 s em silencio
+                # (o Open WebUI nao mostra nada enquanto o Ollama carrega, e parecia que a mensagem tinha sido ignorada)
+                estado["chat_modelo"].update(info="carregando o modelo na placa...", pct=None)
+                pintar(True)
+                with contextlib.suppress(OSError, ValueError):
+                    pedido = json.dumps({"model": CHAT_MODELO, "prompt": "", "keep_alive": "24h"}).encode()
+                    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{OLLAMA_PORT}/api/generate", data=pedido,
+                                                                  headers={"Content-Type": "application/json"}), timeout=300).read()
             if chat_ok:
                 concluir("chat_modelo", CHAT_LOCAL_TAMANHO + {"cpu": " · CPU", "fixa": " · GPU fixa"}.get(CHAT_MODO, " · GPU"))
             else:
