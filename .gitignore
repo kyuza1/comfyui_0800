@@ -1,0 +1,7 @@
+# arquivos de teste gerados localmente
+teste_*.wav
+teste_*.png
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.claude/
