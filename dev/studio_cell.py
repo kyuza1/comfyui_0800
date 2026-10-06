@@ -377,6 +377,7 @@ CHAT_CPU_NOME = "studio-chat-cpu"   # copia do modelo configurada para nao usar 
 CHAT_URL = f"http://127.0.0.1:{OLLAMA_PORT}/v1/chat/completions"
 CHAT_MODELO = CHAT_LOCAL_MODELO     # vira CHAT_CPU_NOME depois que a copia de CPU e criada
 CHAT_LIGADO = CHAT_LOCAL            # vira False se a instalacao da IA falhar
+ARQUIVOS = CHAT_LOCAL               # criar Excel, Word, PDF, PowerPoint... (a IA escreve o conteudo); vira False se a instalacao falhar
 
 # voz (Chatterbox pt-BR): ambiente Python separado, porque ele exige outra versao do torch
 VOZ_PORT = 8189
@@ -958,6 +959,11 @@ function mostrarAudio(url, tocar) {
   const l = document.createElement("a"); l.href = url; l.download = ""; l.textContent = "baixar áudio";
   d.append(a, l); alvo.append(d); rolar();
 }
+function mostrarArquivo(url, nome) {
+  const d = document.createElement("div"); d.className = "midia";
+  const l = document.createElement("a"); l.href = url; l.download = nome; l.textContent = "baixar " + nome;
+  d.append(l); alvo.append(d); rolar();
+}
 function estado(texto, cor) { $("estado").textContent = texto; $("estado").style.color = cor || ""; }
 function travar(sim) { ocupado = sim; $("enviar").disabled = sim; estado(sim ? "⠿ trabalhando..." : "● pronto", sim ? "var(--azul)" : "var(--verde)"); }
 const dorme = (ms) => new Promise(r => setTimeout(r, ms));
@@ -1134,6 +1140,7 @@ async function responder() {
       else if (ev.tipo === "ferramenta") atual = tarefa(ev.nome + " · " + ev.resumo);
       else if (ev.tipo === "imagem") mostrarImagem(ev.url);
       else if (ev.tipo === "audio") mostrarAudio(ev.url);
+      else if (ev.tipo === "arquivo") mostrarArquivo(ev.url, ev.nome);
       else if (ev.tipo === "erro") tarefa("").erro(ev.texto);
     }
     if (j.fim) {
@@ -1431,6 +1438,7 @@ ETAPAS = [
     *([("nodes", "Instalar nodes extras", "Kosinkadink")] if PERFIL_ATUAL.get("nodes") else []),
     *([("voz_inst", "Instalar Chatterbox (voz)", "resemble-ai"), ("voz_modelo", "Baixar modelo de voz pt-BR", "resemble-ai")] if VOZ else []),
     *([("chat_inst", "Instalar IA de chat (Ollama)", "ollama"), ("chat_modelo", f"Baixar {CHAT_ROTULO} (chat)", "QwenLM")] if CHAT_LOCAL else []),
+    *([("arquivos", "Instalar criador de arquivos (Excel, Word, PDF, PowerPoint)", "python-openxml")] if ARQUIVOS else []),
     *([("webui", "Instalar Open WebUI (chat completo)", "open-webui")] if WEBUI else []),
     *([("ouvir", f"Instalar Whisper {WHISPER} (ouvir)", "openai")] if OUVIR else []),
     *([("fundo", "Instalar removedor de fundo (rembg)", "danielgatis")] if REMOVER_FUNDO else []),
@@ -2533,6 +2541,308 @@ def resultado_fala_mcp(jid):
     return {"content": [{"type": "text", "text": "Audio ready (WAV, 24 kHz): " + com_chave(f"{base_api()}/audio/{jid}.wav")}]}
 
 
+# ------------------------------------------------------------------------------
+# ARQUIVOS: a IA escreve o conteudo e o Studio monta o arquivo (Excel, Word, PDF, PowerPoint, CSV, Markdown, texto)
+# ------------------------------------------------------------------------------
+# Tudo na CPU, com bibliotecas pequenas (openpyxl, python-docx, python-pptx, fpdf2): nao pesa na placa.
+# Os arquivos vao para a galeria (e para o Drive, com SALVAR_NO_DRIVE) e voltam como link de download.
+
+FORMATOS_ARQUIVO = {
+    "xlsx": "planilha do Excel", "csv": "planilha CSV", "docx": "documento do Word", "pdf": "PDF",
+    "pptx": "apresentação do PowerPoint", "md": "texto em Markdown (README)", "txt": "texto simples",
+}
+TIPOS_ARQUIVO = {
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "csv": "text/csv; charset=utf-8",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "pdf": "application/pdf",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "md": "text/markdown; charset=utf-8", "txt": "text/plain; charset=utf-8",
+}
+AZUL_DOC = "172DD7"
+
+
+def _nome_arquivo(titulo, ext):
+    import unicodedata
+    sem_acento = unicodedata.normalize("NFKD", html.unescape(str(titulo or "arquivo"))).encode("ascii", "ignore").decode()   # "mês" -> "mes"
+    base = re.sub(r"[^a-zA-Z0-9]+", "_", sem_acento).strip("_")[:40] or "arquivo"
+    return f"{base.lower()}_{uuid.uuid4().hex[:6]}.{ext}"
+
+
+def _linhas_markdown(texto):
+    """Markdown simples -> [(tipo, nivel, texto)]: titulo (# a ###), item (- ou 1.), paragrafo. O bastante para Word e PDF."""
+    blocos = []
+    for linha in str(texto or "").replace("\r", "").split("\n"):
+        crua = linha.strip()
+        if not crua:
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)", crua)
+        if m:
+            blocos.append(("titulo", len(m.group(1)), m.group(2)))
+        elif re.match(r"^[-*•]\s+", crua):
+            blocos.append(("item", 0, re.sub(r"^[-*•]\s+", "", crua)))
+        elif re.match(r"^\d+[.)]\s+", crua):
+            blocos.append(("numero", 0, crua))
+        else:
+            blocos.append(("paragrafo", 0, crua))
+    return blocos
+
+
+def _pedacos_negrito(texto):
+    """'um **dois** tres' -> [('um ', False), ('dois', True), (' tres', False)]."""
+    partes = re.split(r"(\*\*[^*]+\*\*)", texto)
+    return [(p[2:-2], True) if p.startswith("**") and p.endswith("**") else (p, False) for p in partes if p]
+
+
+def _tabela(colunas, linhas):
+    colunas = [str(c) for c in (colunas or [])]
+    linhas = [list(l) if isinstance(l, (list, tuple)) else [l] for l in (linhas or [])]
+    if not colunas and linhas:
+        colunas, linhas = [str(c) for c in linhas[0]], linhas[1:]
+    if not colunas:
+        raise ValueError("para planilha, mande 'colunas' (os títulos) e 'linhas' (uma lista por linha)")
+
+    def numero(v):   # "1.234,50" e "R$ 10" viram numero de verdade, para dar para somar no Excel
+        if isinstance(v, (int, float)) or v is None:
+            return v
+        t = re.sub(r"^(R\$|US\$|\$)\s*", "", str(v).strip())
+        if re.fullmatch(r"-?\d{1,3}(\.\d{3})*(,\d+)?", t):
+            return float(t.replace(".", "").replace(",", "."))
+        if re.fullmatch(r"-?\d+([.,]\d+)?", t):
+            return float(t.replace(",", "."))
+        return v
+    return colunas, [[numero(v) for v in l] + [None] * (len(colunas) - len(l)) for l in linhas]
+
+
+def _celula_texto(v):
+    """Valor de tabela como texto, no padrao brasileiro: 9.5 -> '9,5', 1500.0 -> '1500'."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else f"{v:.2f}".rstrip("0").replace(".", ",")
+    return str(v)
+
+
+def _xlsx(caminho, titulo, colunas, linhas):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    colunas, linhas = _tabela(colunas, linhas)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = re.sub(r"[\[\]:*?/\\]", "", str(titulo))[:31] or "Dados"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(colunas))
+    c = ws.cell(row=1, column=1, value=str(titulo))
+    c.font, c.fill = Font(size=14, bold=True, color="FFFFFF"), PatternFill("solid", start_color=AZUL_DOC)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+    borda = Border(*(Side(style="thin", color="D0D7DE"),) * 4)
+    for j, nome in enumerate(colunas, 1):
+        c = ws.cell(row=2, column=j, value=nome)
+        c.font, c.fill, c.border = Font(bold=True), PatternFill("solid", start_color="E8EBFF"), borda
+        c.alignment = Alignment(horizontal="center")
+    for i, linha in enumerate(linhas, 3):
+        for j, valor in enumerate(linha[:len(colunas)], 1):
+            c = ws.cell(row=i, column=j, value=valor)
+            c.border = borda
+            if isinstance(valor, float) and not valor.is_integer():
+                c.number_format = "#,##0.00"
+    # linha de total nas colunas numericas
+    numericas = [j for j in range(1, len(colunas) + 1) if linhas and all(isinstance(l[j - 1], (int, float)) or l[j - 1] is None for l in linhas)
+                 and any(isinstance(l[j - 1], (int, float)) for l in linhas)]
+    if numericas and len(linhas) > 1:
+        fim = len(linhas) + 2
+        ws.cell(row=fim + 1, column=1, value="Total").font = Font(bold=True)
+        for j in numericas:
+            if j == 1:
+                continue
+            letra = get_column_letter(j)
+            c = ws.cell(row=fim + 1, column=j, value=f"=SUM({letra}3:{letra}{fim})")
+            c.font, c.number_format = Font(bold=True), "#,##0.00"
+    for j, coluna in enumerate(ws.columns, 1):
+        largura = max(len(str(c.value or "")) for c in list(coluna)[1:]) if ws.max_row > 1 else 10
+        ws.column_dimensions[get_column_letter(j)].width = min(60, max(12, largura + 3))
+    ws.freeze_panes = "A3"
+    wb.save(caminho)
+
+
+def _csv(caminho, colunas, linhas):
+    import csv
+    colunas, linhas = _tabela(colunas, linhas)
+    with open(caminho, "w", newline="", encoding="utf-8-sig") as f:   # utf-8-sig: o Excel abre os acentos certo
+        escritor = csv.writer(f, delimiter=";")
+        escritor.writerow(colunas)
+        escritor.writerows([["" if v is None else str(v).replace(".", ",") if isinstance(v, float) else v for v in l] for l in linhas])
+
+
+def _docx(caminho, titulo, texto, colunas, linhas):
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    doc = Document()
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(11)
+    cabecalho = doc.add_heading(str(titulo), level=0)
+    for r in cabecalho.runs:
+        r.font.color.rgb = RGBColor.from_string(AZUL_DOC)
+    for tipo, nivel, conteudo in _linhas_markdown(texto):
+        if tipo == "titulo":
+            doc.add_heading(conteudo.replace("**", ""), level=nivel)
+            continue
+        estilo = {"item": "List Bullet", "numero": "List Number"}.get(tipo)
+        if tipo == "numero":
+            conteudo = re.sub(r"^\d+[.)]\s+", "", conteudo)
+        p = doc.add_paragraph(style=estilo) if estilo else doc.add_paragraph()
+        for pedaco, negrito in _pedacos_negrito(conteudo):
+            p.add_run(pedaco).bold = negrito
+    if colunas or linhas:
+        colunas, linhas = _tabela(colunas, linhas)
+        tabela = doc.add_table(rows=1, cols=len(colunas))
+        tabela.style = "Light Grid Accent 1"
+        for c, nome in zip(tabela.rows[0].cells, colunas):
+            c.text = nome
+        for linha in linhas:
+            for c, valor in zip(tabela.add_row().cells, linha):
+                c.text = _celula_texto(valor)
+    doc.save(caminho)
+
+
+def _fonte_pdf():
+    """Uma fonte com acentos e simbolos. No Colab sempre ha a DejaVu (do sistema ou do matplotlib)."""
+    candidatos = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "C:/Windows/Fonts/arial.ttf"]
+    with contextlib.suppress(Exception):
+        import importlib.util
+        especificacao = importlib.util.find_spec("matplotlib")
+        if especificacao and especificacao.submodule_search_locations:
+            candidatos.insert(1, os.path.join(list(especificacao.submodule_search_locations)[0], "mpl-data", "fonts", "ttf", "DejaVuSans.ttf"))
+    for c in candidatos:
+        if os.path.isfile(c):
+            negrito = c.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf").replace("arial.ttf", "arialbd.ttf")
+            return c, negrito if os.path.isfile(negrito) else c
+    return None, None
+
+
+def _pdf(caminho, titulo, texto, colunas, linhas):
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.set_auto_page_break(True, margin=18)
+    pdf.add_page()
+    normal, negrito = _fonte_pdf()
+    if normal:
+        pdf.add_font("Texto", "", normal)
+        pdf.add_font("Texto", "B", negrito)
+        familia = "Texto"
+    else:   # sem fonte com acentos: Helvetica, trocando o que ela nao tem
+        familia = "Helvetica"
+    limpar = (lambda t: t) if normal else (lambda t: t.encode("latin-1", "replace").decode("latin-1"))
+    pdf.set_font(familia, "B", 20)
+    pdf.set_text_color(23, 45, 215)
+    pdf.multi_cell(0, 10, limpar(str(titulo)), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+    pdf.set_text_color(31, 35, 40)
+    for tipo, nivel, conteudo in _linhas_markdown(texto):
+        if tipo == "titulo":
+            pdf.ln(2)
+            pdf.set_font(familia, "B", {1: 16, 2: 14}.get(nivel, 12))
+            pdf.multi_cell(0, 8, limpar(conteudo.replace("**", "")), new_x="LMARGIN", new_y="NEXT")
+            continue
+        pdf.set_font(familia, "", 11)
+        prefixo = "•  " if tipo == "item" else ""
+        pdf.multi_cell(0, 6, limpar(prefixo + conteudo), markdown=True, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1.5)
+    if colunas or linhas:
+        colunas, linhas = _tabela(colunas, linhas)
+        pdf.ln(3)
+        pdf.set_font(familia, "", 10)
+        with pdf.table(text_align="LEFT") as tabela:
+            for linha in [colunas] + [[_celula_texto(v) for v in l] for l in linhas]:
+                r = tabela.row()
+                for v in linha:
+                    r.cell(limpar(str(v)))
+    pdf.output(caminho)
+
+
+def _pptx(caminho, titulo, slides):
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+    if not slides:
+        raise ValueError("para apresentação, mande 'slides': uma lista de {titulo, topicos}")
+    prs = Presentation()
+    capa = prs.slides.add_slide(prs.slide_layouts[0])
+    capa.shapes.title.text = str(titulo)
+    capa.shapes.title.text_frame.paragraphs[0].font.color.rgb = RGBColor.from_string(AZUL_DOC)
+    capa.placeholders[1].text = "Feito com o ComfyUI Studio"
+    for s in slides:
+        s = s if isinstance(s, dict) else {"titulo": str(s), "topicos": []}
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = str(s.get("titulo") or s.get("title") or "")
+        slide.shapes.title.text_frame.paragraphs[0].font.color.rgb = RGBColor.from_string(AZUL_DOC)
+        corpo = slide.placeholders[1].text_frame
+        corpo.word_wrap = True
+        topicos = s.get("topicos") or s.get("bullets") or s.get("pontos") or []
+        for i, t in enumerate(topicos if isinstance(topicos, list) else [topicos]):
+            p = corpo.paragraphs[0] if i == 0 else corpo.add_paragraph()
+            p.text = str(t)
+            p.font.size = Pt(20)
+        if s.get("notas"):
+            slide.notes_slide.notes_text_frame.text = str(s["notas"])
+    prs.save(caminho)
+
+
+def criar_arquivo(dados):
+    """{formato, titulo, texto?, colunas?, linhas?, slides?} -> (nome do arquivo na galeria, url para baixar)."""
+    formato = str(dados.get("formato") or "").lower().lstrip(".")
+    formato = {"excel": "xlsx", "planilha": "xlsx", "word": "docx", "documento": "docx", "powerpoint": "pptx", "slides": "pptx",
+               "apresentacao": "pptx", "markdown": "md", "readme": "md", "texto": "txt"}.get(formato, formato)
+    if formato not in FORMATOS_ARQUIVO:
+        raise ValueError("formato precisa ser um destes: " + ", ".join(FORMATOS_ARQUIVO))
+    titulo = str(dados.get("titulo") or dados.get("title") or "Arquivo").strip()[:120]
+    texto = dados.get("texto") or dados.get("conteudo") or ""
+    colunas, linhas = dados.get("colunas"), dados.get("linhas")
+    pasta = os.path.join(COMFY, "output")
+    os.makedirs(pasta, exist_ok=True)
+    nome = _nome_arquivo(titulo, formato)
+    caminho = os.path.join(pasta, nome)
+    if formato == "xlsx":
+        _xlsx(caminho, titulo, colunas, linhas)
+    elif formato == "csv":
+        _csv(caminho, colunas, linhas)
+    elif formato == "docx":
+        _docx(caminho, titulo, texto, colunas, linhas)
+    elif formato == "pdf":
+        _pdf(caminho, titulo, texto, colunas, linhas)
+    elif formato == "pptx":
+        _pptx(caminho, titulo, dados.get("slides"))
+    else:
+        if not str(texto).strip():
+            raise ValueError("mande o conteúdo em 'texto'")
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write(str(texto).rstrip() + "\n")
+    registrar(f"arquivo criado · {nome}")
+    return nome, com_chave(f"{base_api()}/imagem/{urllib.parse.quote(nome)}")
+
+
+ARQUIVO_PARAMETROS = {
+    "type": "object",
+    "properties": {
+        "formato": {"type": "string", "enum": list(FORMATOS_ARQUIVO),
+                    "description": "xlsx = Excel, csv, docx = Word, pdf, pptx = PowerPoint, md = Markdown/README, txt"},
+        "titulo": {"type": "string", "description": "Título do arquivo (vira o nome e o cabeçalho)."},
+        "texto": {"type": "string", "description": "Para docx, pdf, md e txt: o conteúdo completo em Markdown simples "
+                                                  "(# títulos, - listas, **negrito**). Escreva o texto inteiro, não um resumo."},
+        "colunas": {"type": "array", "items": {"type": "string"}, "description": "Para xlsx e csv (e opcional em docx/pdf): os títulos das colunas."},
+        "linhas": {"type": "array", "items": {"type": "array", "items": {}},
+                   "description": "Para xlsx e csv: uma lista por linha, na ordem das colunas. Números sem 'R$'."},
+        "slides": {"type": "array", "items": {"type": "object", "properties": {
+                       "titulo": {"type": "string"}, "topicos": {"type": "array", "items": {"type": "string"}},
+                       "notas": {"type": "string", "description": "Opcional: o que falar neste slide."}}},
+                   "description": "Para pptx: um item por slide, cada um com titulo e 3 a 6 topicos curtos."},
+    },
+    "required": ["formato", "titulo"],
+}
+ARQUIVO_DESCRICAO = ("Cria um arquivo para o usuário baixar: planilha Excel ou CSV, documento Word, PDF, apresentação PowerPoint, "
+                     "Markdown (README) ou texto. Você escreve todo o conteúdo de verdade (dados, textos, slides) e a ferramenta monta o arquivo. "
+                     "Use quando pedirem uma planilha, tabela, documento, relatório, currículo, contrato, apresentação, slides ou README.")
+
+
 MCP_TOOLS_VOZ = [
     {
         "name": "speak",
@@ -2635,6 +2945,9 @@ if EFEITOS:
     MCP_TOOLS.append(MCP_TOOLS_AUDIO["efeito"])
 if VOZ:
     MCP_TOOLS += MCP_TOOLS_VOZ
+if ARQUIVOS:
+    MCP_TOOLS.append({"name": "create_file", "description": ARQUIVO_DESCRICAO + " Returns the download link: show it to the user as a Markdown link.",
+                      "inputSchema": ARQUIVO_PARAMETROS})
 
 
 def resultado_mcp(pid, seed=None):
@@ -2698,6 +3011,10 @@ def mcp_responder(msg):
                 resultado = resultado_fala_mcp(iniciar_fala(args.get("text"), args.get("voice"), args.get("exaggeration"), args.get("cfg_weight")))
             elif nome == "get_audio":
                 resultado = resultado_fala_mcp(nome_seguro(args.get("id")))
+            elif nome == "create_file":
+                arquivo, url = criar_arquivo(args)
+                registrar("MCP create_file · " + arquivo)
+                resultado = {"content": [{"type": "text", "text": f"Ready. Download: [{arquivo}]({url})"}]}
             elif nome == "list_voices":
                 resultado = {"content": [{"type": "text", "text": "Saved voices: " + (", ".join(listar_vozes()) or "none (only the built-in voice)")}]}
             else:
@@ -2717,11 +3034,15 @@ def mcp_responder(msg):
 trabalhos_chat = {}
 
 CHAT_SISTEMA_SO_CHAT = "Você é um assistente direto e útil. Responda em português do Brasil, a não ser que peçam outro idioma."
+CHAT_ARQUIVOS = ("Quando pedirem uma planilha, tabela, documento, relatório, PDF, currículo, apresentação, slides ou README, chame criar_arquivo "
+                 "com o conteúdo completo escrito por você (dados reais e coerentes, textos inteiros, 5 a 10 slides) em vez de colar o conteúdo na conversa. ")
+if ARQUIVOS:
+    CHAT_SISTEMA_SO_CHAT += " " + CHAT_ARQUIVOS
 CHAT_SISTEMA = CHAT_SISTEMA_SO_CHAT if SO_CHAT else (
     "Você é o assistente do ComfyUI Studio, um estúdio de criação que roda no Google Colab do usuário. "
     f"O modelo de imagem carregado é {PERFIL_ATUAL['nome']}" + (" e a voz em português (Chatterbox) está ligada. " if VOZ else ". A voz está desligada nesta sessão. ")
     + PERFIL_ATUAL.get("nota_chat", "")
-    + "Responda em português do Brasil, de forma direta e curta. "
+    + "Responda em português do Brasil, de forma direta e curta. " + (CHAT_ARQUIVOS if ARQUIVOS else "") +
     "Quando o usuário pedir uma imagem, chame gerar_imagem com um prompt detalhado em inglês (sujeito, cenário, luz, estilo, enquadramento); "
     "se o pedido for vago, escolha você os detalhes em vez de perguntar. Cada imagem leva cerca de um minuto, então gere uma por vez, "
     "a não ser que peçam mais. A imagem e o áudio aparecem sozinhos na tela do usuário: não repita links nem descreva o arquivo, "
@@ -2794,6 +3115,10 @@ if VOZ:
             "parameters": {"type": "object", "properties": {}},
         }},
     ]
+
+
+if ARQUIVOS:
+    CHAT_TOOLS.append({"type": "function", "function": {"name": "criar_arquivo", "description": ARQUIVO_DESCRICAO, "parameters": ARQUIVO_PARAMETROS}})
 
 
 def chamar_llm(mensagens, com_ferramentas=True, pensar=False, ao_escrever=None, ao_pensar=None, deve_parar=None):
@@ -2879,6 +3204,114 @@ def chamar_llm(mensagens, com_ferramentas=True, pensar=False, ao_escrever=None, 
     return mensagem, {"tokens": tokens, "segundos": round(segundos, 1), "tps": round(velocidade, 1) if velocidade else None}
 
 
+# Skills e atalhos que ja vem instalados no Open WebUI: aparecem quando a pessoa digita "/" no chat.
+# Skill = instrucoes que deixam a IA especialista numa tarefa. Atalho = um pedido pronto, para quem nao sabe por onde comecar.
+SKILLS_WEBUI = [
+    {"id": "gerador-de-prompt", "name": "Gerador de prompt de imagem",
+     "description": "Transforma uma ideia simples num prompt detalhado em inglês para o Z Image e outros geradores.",
+     "content": """Você transforma ideias simples em prompts de imagem excelentes.
+
+Quando o usuário descrever o que quer (mesmo em uma frase curta e em português), responda com:
+1. **Prompt** em inglês, num parágrafo só, nesta ordem: sujeito e ação, roupa e detalhes, cenário, luz, câmera e enquadramento, estilo.
+   Seja concreto: "golden hour side light", "85mm portrait, shallow depth of field", "shot on iPhone, candid".
+2. **Variações**: mais 2 prompts curtos com outra luz ou outro enquadramento.
+3. **Dica** de uma linha em português sobre o que mudar se não ficar bom.
+
+Regras: o Z Image não usa prompt negativo, então descreva o que quer ver (em vez de "sem pessoas", escreva "empty street").
+Para fotos realistas, cite câmera e luz natural. Para personagens caricatos, exagere os traços com números e comparações
+("jaw twice as wide as the forehead"). Nunca invente marcas registradas nem pessoas reais."""},
+    {"id": "criador-de-influencer", "name": "Criador de influencer",
+     "description": "Cria a persona completa de um influencer virtual: nome, personalidade, bio, visual, ideias de posts.",
+     "content": """Você é estrategista de influenciadores virtuais criados com IA.
+
+Quando pedirem um influencer, entregue:
+- **Nome e @** (curto, fácil de lembrar, com o @ livre provável).
+- **Nicho e público** em uma frase.
+- **Personalidade**: 3 traços e o jeito de falar (com 2 exemplos de frases).
+- **Visual fixo**: rosto, cabelo, corpo, estilo de roupa e cores, escrito como um prompt em inglês para manter o personagem sempre igual.
+- **Bio do Instagram** (até 150 caracteres).
+- **10 ideias de posts** variando Reels, carrossel e foto.
+- **Calendário da semana**: o que postar em cada dia.
+
+Se for um personagem engraçado ou caricato, capriche no exagero e no bordão. Personagens são sempre fictícios e adultos.
+Lembre o usuário de avisar nas redes que o perfil é feito com IA."""},
+    {"id": "roteiro-reels", "name": "Roteirista de Reels e TikTok",
+     "description": "Roteiros curtos que prendem nos primeiros 3 segundos, prontos para gravar ou narrar com a voz do Studio.",
+     "content": """Você escreve roteiros de vídeos curtos (Reels, TikTok, Shorts) em português do Brasil.
+
+Formato da resposta:
+- **Gancho (0 a 3 s)**: uma frase que faz parar de rolar a tela. Dê 3 opções.
+- **Roteiro** em cenas numeradas, cada uma com: o que aparece na tela, o texto falado e o texto escrito na tela.
+- **Final** com chamada para ação (seguir, comentar, salvar).
+- **Narração**: o texto falado inteiro junto, pronto para colar na ferramenta de voz.
+- **Legenda** com 3 a 5 hashtags.
+
+Padrão: 30 segundos, linguagem falada e simples, frases curtas. Se o usuário der o nicho, adapte as gírias e as referências."""},
+    {"id": "legendas-hashtags", "name": "Legendas e hashtags",
+     "description": "Legendas para Instagram e TikTok em vários tons, com hashtags certas para o nicho.",
+     "content": """Você escreve legendas para redes sociais em português do Brasil.
+
+Para cada pedido, entregue 3 legendas em tons diferentes (divertido, inspirador, direto ao ponto). Cada uma com:
+- primeira linha forte (é o que aparece antes do "mais"),
+- corpo curto, com quebras de linha,
+- chamada para ação no final,
+- 5 a 10 hashtags: misture as grandes do nicho com outras menores e mais específicas.
+Use emojis com moderação, só onde ajudam a leitura."""},
+    {"id": "copy-vendas", "name": "Copy de vendas",
+     "description": "Anúncios, descrição de produto e mensagens de WhatsApp que vendem.",
+     "content": """Você é redator publicitário focado em vendas para pequenos negócios brasileiros.
+
+Antes de escrever, se faltar informação essencial (produto, preço, público), faça no máximo 2 perguntas. Depois entregue:
+- **Título** chamativo (3 opções).
+- **Texto do anúncio** curto, usando a estrutura problema, solução, prova, oferta, chamada para ação.
+- **Descrição do produto** para loja virtual ou Mercado Livre, com tópicos de benefícios.
+- **Mensagem de WhatsApp** pronta para enviar aos clientes, curta e pessoal.
+Sem promessas falsas ou exageradas. Linguagem simples e direta."""},
+    {"id": "explica-facil", "name": "Explica fácil",
+     "description": "Explica qualquer assunto como para quem nunca ouviu falar, com exemplos do dia a dia.",
+     "content": """Você explica qualquer assunto para quem nunca ouviu falar dele.
+
+Regras:
+- Comece com a ideia principal em uma frase.
+- Use uma comparação com algo do dia a dia brasileiro.
+- Explique em passos curtos, sem jargão. Se precisar de um termo técnico, explique na hora entre parênteses.
+- Termine com um exemplo prático e uma pergunta para ver se a pessoa entendeu.
+Se a pessoa disser que não entendeu, explique de outro jeito, ainda mais simples."""},
+]
+
+ATALHOS_WEBUI = [   # (comando, nome, texto que entra na caixa de mensagem)
+    ("planilha", "Criar planilha Excel", "Crie uma planilha Excel de "),
+    ("documento", "Criar documento Word", "Crie um documento Word com "),
+    ("pdf", "Criar PDF", "Crie um PDF com "),
+    ("slides", "Criar apresentação", "Crie uma apresentação de 8 slides sobre "),
+    ("curriculo", "Criar currículo", "Crie um currículo em PDF para mim. Meus dados: nome, cidade, experiências, formação e habilidades: "),
+    ("readme", "Criar README", "Crie um README.md para o meu projeto: "),
+]
+
+SUGESTOES_WEBUI = [   # aparecem na tela inicial de cada conversa nova
+    {"title": ["Criar uma planilha", "de gastos do mês"], "content": "Crie uma planilha Excel para controlar os gastos do mês de uma família, com categorias e exemplos."},
+    {"title": ["Roteiro de Reels", "de 30 segundos"], "content": "Escreva um roteiro de Reels de 30 segundos sobre "},
+    {"title": ["Criar um influencer", "virtual"], "content": "Crie a persona de um influencer virtual de "},
+    {"title": ["Pesquisar na internet", "as notícias de hoje"], "content": "Pesquise na internet as principais notícias de hoje no Brasil e resuma em tópicos."},
+]
+
+
+def preparar_webui(token):
+    """Instala as skills e os atalhos no Open WebUI recem-criado. Se alguma falhar, o chat continua normal."""
+    base = f"http://127.0.0.1:{WEBUI_PORT}/api/v1"
+    cabecalhos = {"Content-Type": "application/json", **({"Authorization": f"Bearer {token}"} if token else {})}
+
+    def postar(caminho, dados):
+        with contextlib.suppress(OSError, ValueError):
+            urllib.request.urlopen(urllib.request.Request(base + caminho, data=json.dumps(dados).encode(), headers=cabecalhos), timeout=30).read()
+            return True
+        return False
+
+    criadas = sum(postar("/skills/create", {**s, "meta": {}, "is_active": True}) for s in SKILLS_WEBUI)
+    atalhos = sum(postar("/prompts/create", {"command": c, "name": n, "content": t}) for c, n, t in ATALHOS_WEBUI if ARQUIVOS)
+    return criadas, atalhos
+
+
 def ambiente_webui():
     """Variaveis que ligam o Open WebUI ao que esta sessao tem. Tudo passa pela nossa API (http://127.0.0.1), nunca pelo tunel.
 
@@ -2896,6 +3329,10 @@ def ambiente_webui():
         "ENABLE_TITLE_GENERATION": "False",   # cada titulo e uma chamada a mais a IA, e no Colab ela ainda falhava (KeyError 'model')
         "ENABLE_AUTOMATIONS": "False", "ENABLE_CALENDAR": "False", "ENABLE_MEMORIES": "False", "ENABLE_NOTES": "False",
         "ENABLE_CODE_INTERPRETER": "False", "ENABLE_CODE_EXECUTION": "False",
+        # pesquisa na web pelo DuckDuckGo: nao precisa de chave. Sem a etapa de embeddings, que baixaria mais um modelo e pesaria na RAM
+        "ENABLE_WEB_SEARCH": "True", "WEB_SEARCH_ENGINE": "duckduckgo", "WEB_SEARCH_RESULT_COUNT": "3",
+        "BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL": "True",
+        "DEFAULT_PROMPT_SUGGESTIONS": json.dumps(SUGESTOES_WEBUI, ensure_ascii=False),
         # as ferramentas do Studio (imagem, video, som, voz, recorte) entram como um servidor MCP
         "TOOL_SERVER_CONNECTIONS": json.dumps([{
             "url": f"http://127.0.0.1:{API_PORT}/mcp", "path": "", "type": "mcp", "auth_type": "bearer" if CHAVE_API else "none", "key": CHAVE_API,
@@ -2989,6 +3426,10 @@ def ferramenta_chat(nome, args, evento):
         _, arquivo = remover_fundo(bytes_da_imagem(args.get("imagem") or ""))
         evento("imagem", url="/imagem/" + urllib.parse.quote(arquivo))
         return f"Fundo removido e recorte já exibido ao usuário. Arquivo: {arquivo}."
+    if nome == "criar_arquivo":
+        arquivo, _ = criar_arquivo(args)
+        evento("arquivo", url="/imagem/" + urllib.parse.quote(arquivo), nome=arquivo)
+        return f"Arquivo criado e o link de download já aparece para o usuário: {arquivo}. Não repita o link."
     if nome in ("gerar_musica", "gerar_efeito"):
         pid, seed = enfileirar_audio("musica" if nome == "gerar_musica" else "efeito", args.get("prompt"), args.get("letra"), args.get("segundos"))
         pronto = esperar(pid, 1800)
@@ -3000,7 +3441,7 @@ def ferramenta_chat(nome, args, evento):
 
 
 def resumo_args(nome, args):
-    texto = str(args.get("prompt") or args.get("texto") or args.get("imagem") or "")
+    texto = str(args.get("prompt") or args.get("titulo") or args.get("texto") or args.get("imagem") or "")
     return '"' + texto[:90] + ('…"' if len(texto) > 90 else '"') if texto else ""
 
 
@@ -3562,11 +4003,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 })
             elif caminho.startswith("/imagem/"):
                 nome = os.path.basename(urllib.parse.unquote(caminho[len("/imagem/"):]))
-                url = f"http://127.0.0.1:{PORT}/view?" + urllib.parse.urlencode({"filename": nome, "type": "output"})
-                try:
-                    self._enviar(200, urllib.request.urlopen(url, timeout=60).read(), tipo_imagem(nome))
-                except urllib.error.HTTPError:
-                    self._enviar(404, {"erro": "imagem não encontrada"})
+                no_disco = os.path.join(COMFY, "output", nome)
+                ext = nome.rsplit(".", 1)[-1].lower()
+                if nome and os.path.isfile(no_disco):
+                    with open(no_disco, "rb") as f:
+                        conteudo = f.read()
+                    if ext in TIPOS_ARQUIVO:   # documentos: o navegador baixa em vez de tentar abrir
+                        self._enviar(200, conteudo, TIPOS_ARQUIVO[ext], {"Content-Disposition": f'attachment; filename="{nome}"'})
+                    else:
+                        self._enviar(200, conteudo, tipo_imagem(nome))
+                else:
+                    url = f"http://127.0.0.1:{PORT}/view?" + urllib.parse.urlencode({"filename": nome, "type": "output"})
+                    try:
+                        self._enviar(200, urllib.request.urlopen(url, timeout=60).read(), tipo_imagem(nome))
+                    except OSError:
+                        self._enviar(404, {"erro": "arquivo não encontrado"})
             elif caminho.startswith("/resultado/"):
                 pid = validar_id(caminho[len("/resultado/"):])
                 pronto = esperar(pid, 60)
@@ -4032,6 +4483,25 @@ try:
         if not chat_ok:
             CHAT_LIGADO = False
 
+    # Criador de arquivos (opcional: se falhar, so essa ferramenta some)
+    if ARQUIVOS:
+        comecar("arquivos", "pip install openpyxl python-docx python-pptx fpdf2")
+        import importlib.metadata
+        with open("/content/restricoes_pip.txt", "w") as f:
+            for pacote in ("pillow", "numpy", "torch", "torchvision", "torchaudio", "lxml"):
+                with contextlib.suppress(importlib.metadata.PackageNotFoundError):
+                    f.write(f"{pacote}=={importlib.metadata.version(pacote)}\n")
+        rodar("arquivos", [sys.executable, "-m", "pip", "install", "-q", "-c", "/content/restricoes_pip.txt",
+                           "openpyxl", "python-docx", "python-pptx", "fpdf2"], obrigatorio=False)
+        try:
+            import openpyxl, docx, pptx, fpdf   # noqa: F401  (so confere se instalou)
+            concluir("arquivos", "xlsx · docx · pdf · pptx · csv · md")
+        except ImportError as ex:
+            ARQUIVOS = False
+            MCP_TOOLS[:] = [t for t in MCP_TOOLS if t["name"] != "create_file"]
+            CHAT_TOOLS[:] = [t for t in CHAT_TOOLS if t["function"]["name"] != "criar_arquivo"]
+            avisar("arquivos", f"não instalou ({ex.name}); a criação de arquivos fica desligada")
+
     # Open WebUI: chat completo, ligado na IA local (opcional: se falhar, o chat do Studio continua)
     if WEBUI and CHAT_LIGADO:
         comecar("webui", "uv venv (Python 3.11) + open-webui")
@@ -4062,16 +4532,23 @@ try:
                     pass
                 pintar()
                 time.sleep(1)
+            token_webui = None
             if webui_ligado and CHAVE_API:
                 # o primeiro cadastro vira o administrador; depois dele, o proprio Open WebUI recusa cadastros novos
                 try:
                     cadastro = json.dumps({"name": "Studio", "email": WEBUI_LOGIN, "password": CHAVE_API}).encode()
-                    urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{WEBUI_PORT}/api/v1/auths/signup", data=cadastro,
-                                                                  headers={"Content-Type": "application/json"}), timeout=60).read()
+                    resposta = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{WEBUI_PORT}/api/v1/auths/signup", data=cadastro,
+                                                                             headers={"Content-Type": "application/json"}), timeout=60).read()
+                    with contextlib.suppress(ValueError):
+                        token_webui = json.loads(resposta).get("token")
                 except OSError:
                     webui_ligado = False
+            if webui_ligado:
+                estado["webui"]["info"] = "instalando skills e atalhos..."
+                pintar(True)
+                skills_ok, atalhos_ok = preparar_webui(token_webui)
         if webui_ligado:
-            concluir("webui", "login: " + WEBUI_LOGIN if CHAVE_API else "sem login")
+            concluir("webui", ("login: " + WEBUI_LOGIN if CHAVE_API else "sem login") + f" · {skills_ok} skills · {atalhos_ok} atalhos · pesquisa na web")
         else:
             if webui_proc is not None and webui_proc.poll() is None:
                 webui_proc.terminate()

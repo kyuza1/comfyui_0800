@@ -145,6 +145,9 @@ O pack **Chat sem censura** liga uma IA que roda **dentro do seu Colab**, e não
 - **Sem recusas.** São versões do Qwen3.5 com as recusas removidas (os modelos "abliterated").
 - **Privado.** As conversas ficam só na sua sessão. Quando o Colab desliga, elas somem, então salve o que for importante.
 - **Chat completo (Open WebUI):** histórico de conversas, editar mensagens, código formatado, enviar arquivos e imagens.
+- **Cria arquivos para baixar:** peça "faz uma planilha de gastos do mês", "cria um currículo em PDF" ou "faz 8 slides sobre marketing" e baixe o arquivo pronto. Funciona com Excel, Word, PDF, PowerPoint, CSV e Markdown, e o arquivo também vai para o seu Drive.
+- **Pesquisa na internet:** ligue a opção de pesquisa na caixa de mensagem e a IA busca no DuckDuckGo antes de responder.
+- **Skills prontas:** digite **/** no chat e escolha um especialista. Tem gerador de prompt de imagem, criador de influencer, roteirista de Reels e TikTok, legendas e hashtags, copy de vendas e "explica fácil". Também tem atalhos como **/planilha**, **/pdf**, **/slides** e **/curriculo**.
 
 ---
 
@@ -263,6 +266,7 @@ O Studio só junta e configura ferramentas abertas criadas por outras pessoas. C
 | <img src="https://github.com/ollama.png?size=40" width="20"> | [Ollama](https://github.com/ollama/ollama) | Roda o chat | MIT |
 | <img src="https://github.com/open-webui.png?size=40" width="20"> | [Open WebUI](https://github.com/open-webui/open-webui) | Tela do chat | Open WebUI License |
 | <img src="https://github.com/SYSTRAN.png?size=40" width="20"> | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | Microfone (fala para texto) | MIT |
+| <img src="https://github.com/python-openxml.png?size=40" width="20"> | [python-docx](https://github.com/python-openxml/python-docx), [python-pptx](https://github.com/scanny/python-pptx), [openpyxl](https://foss.heptapod.net/openpyxl/openpyxl) e [fpdf2](https://github.com/py-pdf/fpdf2) | Criar Word, PowerPoint, Excel e PDF | MIT e LGPL |
 | <img src="https://github.com/danielgatis.png?size=40" width="20"> | [rembg](https://github.com/danielgatis/rembg) | Remover fundo | MIT |
 | <img src="https://github.com/cloudflare.png?size=40" width="20"> | [Cloudflare Tunnel](https://github.com/cloudflare/cloudflared) | Links públicos | Apache 2.0 |
 | <img src="https://github.com/googlecolab.png?size=40" width="20"> | [Google Colab](https://colab.research.google.com) | A máquina grátis com a T4 | |
